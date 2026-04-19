@@ -6,11 +6,13 @@
 #include "mcp_server.h"
 #include <esp_log.h>
 #include <esp_app_desc.h>
+#include <esp_system.h>
 #include <algorithm>
 #include <cstring>
 #include <esp_pthread.h>
 
 #include "application.h"
+#include "audio/mp3_url_player.h"
 #include "display.h"
 #include "oled_display.h"
 #include "board.h"
@@ -19,6 +21,93 @@
 #include "lvgl_display.h"
 
 #define TAG "MCP"
+
+namespace {
+
+constexpr int kMusicApiHttpTimeoutMs = 20000;
+constexpr int kMusicApiMaxAttempts = 3;
+constexpr char kMusicPlaybackTestUrl[] = "https://samplelib.com/mp3/sample-15s.mp3";
+
+std::string UrlEncode(const std::string& value) {
+    static const char kHexChars[] = "0123456789ABCDEF";
+    std::string encoded;
+    encoded.reserve(value.size() * 3);
+    for (unsigned char c : value) {
+        if ((c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~') {
+            encoded.push_back(static_cast<char>(c));
+        } else {
+            encoded.push_back('%');
+            encoded.push_back(kHexChars[(c >> 4) & 0x0F]);
+            encoded.push_back(kHexChars[c & 0x0F]);
+        }
+    }
+    return encoded;
+}
+
+cJSON* HttpGetJsonOrThrow(const std::string& url, const char* operation) {
+    std::string last_error;
+    for (int attempt = 1; attempt <= kMusicApiMaxAttempts; ++attempt) {
+        auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
+        if (!http) {
+            last_error = std::string(operation) + ": failed to create HTTP client";
+            ESP_LOGW(TAG, "%s (attempt %d/%d)", last_error.c_str(), attempt, kMusicApiMaxAttempts);
+            continue;
+        }
+
+        http->SetTimeout(kMusicApiHttpTimeoutMs);
+        if (!http->Open("GET", url)) {
+            last_error = std::string(operation) + ": failed to open URL: " + url +
+                ", last_error=" + std::to_string(http->GetLastError());
+            http->Close();
+            ESP_LOGW(TAG, "%s (attempt %d/%d)", last_error.c_str(), attempt, kMusicApiMaxAttempts);
+            continue;
+        }
+
+        int status_code = http->GetStatusCode();
+        if (status_code != 200) {
+            std::string body = http->ReadAll();
+            http->Close();
+            last_error = std::string(operation) + ": unexpected status code: " +
+                std::to_string(status_code) + ", body: " + body;
+            ESP_LOGW(TAG, "%s (attempt %d/%d)", last_error.c_str(), attempt, kMusicApiMaxAttempts);
+            continue;
+        }
+
+        std::string body = http->ReadAll();
+        http->Close();
+
+        cJSON* json = cJSON_Parse(body.c_str());
+        if (json == nullptr) {
+            last_error = std::string(operation) + ": failed to parse response json";
+            ESP_LOGW(TAG, "%s (attempt %d/%d)", last_error.c_str(), attempt, kMusicApiMaxAttempts);
+            continue;
+        }
+        return json;
+    }
+
+    throw std::runtime_error(last_error.empty() ? std::string(operation) + ": request failed" : last_error);
+}
+
+std::string BuildMusicSearchUrl(const std::string& music_name, const std::string& author_name) {
+    std::string url = "https://music.dairoot.cn/list?";
+    bool has_query = false;
+    if (!author_name.empty()) {
+        url += "artist=" + UrlEncode(author_name);
+        has_query = true;
+    }
+    if (!music_name.empty()) {
+        if (has_query) {
+            url += "&";
+        }
+        url += "name=" + UrlEncode(music_name);
+    }
+    return url;
+}
+
+}  // namespace
 
 McpServer::McpServer() {
 }
@@ -61,6 +150,65 @@ void McpServer::AddCommonTools() {
             auto codec = board.GetAudioCodec();
             codec->SetOutputVolume(properties["volume"].value<int>());
             return true;
+        });
+
+    AddTool("search_custom_music",
+        "Search music and get music IDs. Use this tool when the user asks to search or play music. This tool returns a list of music with their IDs, which are required for playing music. Args:\n"
+        "  `music_name`: The name of the music to search (optional)\n"
+        "  `author_name`: The name of the music author (optional)",
+        PropertyList({
+            Property("music_name", kPropertyTypeString, std::string("")),
+            Property("author_name", kPropertyTypeString, std::string(""))
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto music_name = properties["music_name"].value<std::string>();
+            auto author_name = properties["author_name"].value<std::string>();
+            if (music_name.empty() && author_name.empty()) {
+                throw std::runtime_error("At least one of music_name or author_name is required");
+            }
+            return HttpGetJsonOrThrow(BuildMusicSearchUrl(music_name, author_name), "music search request");
+        });
+
+    AddTool("play_custom_music",
+        "Play music using music IDs. IMPORTANT: You must call `search_custom_music` first to get the music IDs before using this tool. Use this tool after getting music IDs from search results. Args:\n"
+        "  `id_list`: The id list of the music to play (obtained from search_custom_music results). The list must contain at least 1 music ID. If multiple IDs are provided, the system will randomly select one to play.\n"
+        "  `music_name`: The name of the music (obtained from search_custom_music results)",
+        PropertyList({
+            Property("id_list", kPropertyTypeStringArray),
+            Property("music_name", kPropertyTypeString, std::string(""))
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto id_list = properties["id_list"].value<std::vector<std::string>>();
+            if (id_list.empty()) {
+                throw std::runtime_error("id_list must contain at least 1 music ID");
+            }
+
+            auto selected_index = esp_random() % id_list.size();
+            auto selected_id = id_list[selected_index];
+            auto music_name = properties["music_name"].value<std::string>();
+            const char* playback_url = kMusicPlaybackTestUrl;
+
+            auto& app = Application::GetInstance();
+            if (app.GetDeviceState() == kDeviceStateSpeaking) {
+                app.AbortSpeaking(kAbortReasonNone);
+            }
+            if (app.GetDeviceState() == kDeviceStateConnecting ||
+                app.GetDeviceState() == kDeviceStateListening ||
+                app.GetDeviceState() == kDeviceStateSpeaking) {
+                app.SetDeviceState(kDeviceStateIdle);
+            }
+
+            if (!Mp3UrlPlayer::GetInstance().Play(playback_url, music_name)) {
+                throw std::runtime_error("Failed to start music player");
+            }
+
+            cJSON* result = cJSON_CreateObject();
+            cJSON_AddStringToObject(result, "status", "started");
+            cJSON_AddStringToObject(result, "selected_id", selected_id.c_str());
+            cJSON_AddStringToObject(result, "music_name", music_name.c_str());
+            cJSON_AddBoolToObject(result, "using_test_url", true);
+            cJSON_AddStringToObject(result, "proxyLink", playback_url);
+            return result;
         });
     
     auto backlight = board.GetBacklight();
@@ -535,6 +683,21 @@ void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* to
                 } else if (argument.type() == kPropertyTypeString && cJSON_IsString(value)) {
                     argument.set_value<std::string>(value->valuestring);
                     found = true;
+                } else if (argument.type() == kPropertyTypeStringArray && cJSON_IsArray(value)) {
+                    std::vector<std::string> values;
+                    bool valid_array = true;
+                    cJSON* item = nullptr;
+                    cJSON_ArrayForEach(item, value) {
+                        if (!cJSON_IsString(item)) {
+                            valid_array = false;
+                            break;
+                        }
+                        values.emplace_back(item->valuestring);
+                    }
+                    if (valid_array) {
+                        argument.set_value<std::vector<std::string>>(values);
+                        found = true;
+                    }
                 }
             }
 

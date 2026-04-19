@@ -52,14 +52,15 @@ using ReturnValue = std::variant<bool, int, std::string, cJSON*, ImageContent*>;
 enum PropertyType {
     kPropertyTypeBoolean,
     kPropertyTypeInteger,
-    kPropertyTypeString
+    kPropertyTypeString,
+    kPropertyTypeStringArray
 };
 
 class Property {
 private:
     std::string name_;
     PropertyType type_;
-    std::variant<bool, int, std::string> value_;
+    std::variant<bool, int, std::string, std::vector<std::string>> value_;
     bool has_default_value_;
     std::optional<int> min_value_;  // 新增：整数最小值
     std::optional<int> max_value_;  // 新增：整数最大值
@@ -143,6 +144,18 @@ public:
             cJSON_AddStringToObject(json, "type", "string");
             if (has_default_value_) {
                 cJSON_AddStringToObject(json, "default", value<std::string>().c_str());
+            }
+        } else if (type_ == kPropertyTypeStringArray) {
+            cJSON_AddStringToObject(json, "type", "array");
+            cJSON* items = cJSON_CreateObject();
+            cJSON_AddStringToObject(items, "type", "string");
+            cJSON_AddItemToObject(json, "items", items);
+            if (has_default_value_) {
+                cJSON* default_array = cJSON_CreateArray();
+                for (const auto& item : value<std::vector<std::string>>()) {
+                    cJSON_AddItemToArray(default_array, cJSON_CreateString(item.c_str()));
+                }
+                cJSON_AddItemToObject(json, "default", default_array);
             }
         }
         
