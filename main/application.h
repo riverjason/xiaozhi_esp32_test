@@ -155,6 +155,7 @@ private:
     void HandleWakeWordDetectedEvent();
     void ContinueOpenAudioChannel(ListeningMode mode);
     void ContinueWakeWordInvoke(const std::string& wake_word);
+    void ContinueTextSessionConflictRepro(ListeningMode mode);
 
     // Activation task (runs in background)
     void ActivationTask();
