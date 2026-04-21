@@ -942,11 +942,6 @@ void Application::HandleStateChangedEvent() {
             audio_service_.ResetDecoder();
             break;
         case kDeviceStateWifiConfiguring:
-            // BluFi provisioning does not show the hotspot alert, so update the
-            // main status here to avoid leaving the startup message on screen.
-            display->SetStatus(Lang::Strings::WIFI_CONFIG_MODE);
-            display->SetEmotion("neutral");
-            display->SetChatMessage("system", "");
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(false);
             break;
