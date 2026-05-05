@@ -19,12 +19,13 @@ namespace {
 
 constexpr int kHttpConnectionId = 3;
 constexpr int kHttpTimeoutMs = 30000;
-constexpr size_t kReadBufferSize = 2048;
+constexpr size_t kReadBufferSize = 4096;
+constexpr size_t kMaxMp3DownloadSize = 6 * 1024 * 1024;
 constexpr size_t kInitialPcmBufferSize = 8192;
 constexpr uint32_t kPlayerTaskStackSize = 16384;
-constexpr size_t kPlaybackChunkMs = 1000;
-constexpr size_t kPlaybackPrebufferMs = 2000;
-constexpr size_t kPlaybackMaxPendingMs = 8000;
+constexpr size_t kPlaybackChunkMs = 2000;
+constexpr size_t kPlaybackPrebufferMs = 4000;
+constexpr size_t kPlaybackMaxPendingMs = 10000;
 
 std::once_flag g_decoder_register_once;
 bool g_decoder_register_ok = false;
@@ -87,6 +88,39 @@ bool EnsureMp3DecoderRegistered() {
         g_decoder_register_ok = true;
     });
     return g_decoder_register_ok;
+}
+
+bool DownloadMp3ToMemory(Http* http, std::vector<uint8_t>& mp3_data) {
+    size_t content_length = http->GetBodyLength();
+    if (content_length > kMaxMp3DownloadSize) {
+        ESP_LOGE(TAG, "MP3 file too large: %u bytes", static_cast<unsigned>(content_length));
+        return false;
+    }
+
+    if (content_length > 0) {
+        mp3_data.reserve(content_length);
+    }
+
+    std::vector<uint8_t> read_buffer(kReadBufferSize);
+    while (true) {
+        int read_size = http->Read(reinterpret_cast<char*>(read_buffer.data()), read_buffer.size());
+        if (read_size < 0) {
+            ESP_LOGE(TAG, "Failed to read mp3 data, last_error=%d", http->GetLastError());
+            return false;
+        }
+        if (read_size == 0) {
+            break;
+        }
+        if (mp3_data.size() + read_size > kMaxMp3DownloadSize) {
+            ESP_LOGE(TAG, "MP3 download exceeded limit: %u bytes",
+                static_cast<unsigned>(mp3_data.size() + read_size));
+            return false;
+        }
+        mp3_data.insert(mp3_data.end(), read_buffer.begin(), read_buffer.begin() + read_size);
+    }
+
+    ESP_LOGI(TAG, "Downloaded MP3: %u bytes", static_cast<unsigned>(mp3_data.size()));
+    return !mp3_data.empty();
 }
 
 }  // namespace
@@ -175,7 +209,16 @@ void Mp3UrlPlayer::PlaybackTask() {
         display->SetChatMessage("assistant", music_name.empty() ? "Playing selected music" : music_name.c_str());
     });
 
+    auto& audio_service = app.GetAudioService();
+    bool restore_wake_word = audio_service.IsWakeWordRunning();
+    if (restore_wake_word) {
+        audio_service.EnableWakeWordDetection(false);
+    }
+
     bool success = DecodeAndPlay(url);
+    if (restore_wake_word && app.GetDeviceState() == kDeviceStateIdle) {
+        audio_service.EnableWakeWordDetection(true);
+    }
     if (stop_requested_.load()) {
         return;
     }
@@ -244,7 +287,13 @@ bool Mp3UrlPlayer::DecodeAndPlay(const std::string& url) {
 
     esp_ae_rate_cvt_handle_t resampler = nullptr;
     int resampler_src_rate = 0;
-    std::vector<uint8_t> read_buffer(kReadBufferSize);
+    std::vector<uint8_t> mp3_data;
+    if (!DownloadMp3ToMemory(http.get(), mp3_data)) {
+        http->Close();
+        return false;
+    }
+    http->Close();
+
     std::vector<uint8_t> pcm_buffer(kInitialPcmBufferSize);
     bool info_ready = false;
     esp_audio_simple_dec_info_t dec_info = {};
@@ -255,7 +304,8 @@ bool Mp3UrlPlayer::DecodeAndPlay(const std::string& url) {
     const size_t playback_max_pending_samples =
         static_cast<size_t>(codec->output_sample_rate()) * codec->output_channels() * kPlaybackMaxPendingMs / 1000;
     std::vector<int16_t> pending_playback_pcm;
-    pending_playback_pcm.reserve(playback_prebuffer_samples * 2);
+    pending_playback_pcm.reserve(playback_prebuffer_samples);
+    size_t pending_playback_offset = 0;
     bool playback_started = false;
 
     audio_service.ResetDecoder();
@@ -263,26 +313,47 @@ bool Mp3UrlPlayer::DecodeAndPlay(const std::string& url) {
     bool success = true;
     bool end_of_stream = false;
     bool decoded_any_frame = false;
+    auto pending_sample_count = [&]() -> size_t {
+        return pending_playback_pcm.size() - pending_playback_offset;
+    };
+    auto compact_pending_pcm = [&]() {
+        if (pending_playback_offset == 0) {
+            return;
+        }
+        if (pending_playback_offset >= pending_playback_pcm.size()) {
+            pending_playback_pcm.clear();
+            pending_playback_offset = 0;
+            return;
+        }
+        if (pending_playback_offset >= playback_chunk_samples ||
+            pending_playback_offset > pending_playback_pcm.size() / 2) {
+            pending_playback_pcm.erase(
+                pending_playback_pcm.begin(),
+                pending_playback_pcm.begin() + pending_playback_offset);
+            pending_playback_offset = 0;
+        }
+    };
     auto flush_pending_pcm = [&](bool flush_all, bool wait_for_queue) -> bool {
-        while (!pending_playback_pcm.empty()) {
+        while (pending_sample_count() > 0) {
             if (!playback_started) {
-                if (!flush_all && pending_playback_pcm.size() < playback_prebuffer_samples) {
+                if (!flush_all && pending_sample_count() < playback_prebuffer_samples) {
                     break;
                 }
                 playback_started = true;
-                ESP_LOGI(TAG, "Start buffered playback: %u samples queued", pending_playback_pcm.size());
+                ESP_LOGI(TAG, "Start buffered playback: %u samples queued",
+                    static_cast<unsigned>(pending_sample_count()));
             }
 
-            if (!flush_all && pending_playback_pcm.size() < playback_chunk_samples) {
+            if (!flush_all && pending_sample_count() < playback_chunk_samples) {
                 break;
             }
 
             size_t chunk_samples = flush_all ?
-                std::min(pending_playback_pcm.size(), playback_chunk_samples) :
+                std::min(pending_sample_count(), playback_chunk_samples) :
                 playback_chunk_samples;
             std::vector<int16_t> playback_pcm(
-                pending_playback_pcm.begin(),
-                pending_playback_pcm.begin() + chunk_samples);
+                pending_playback_pcm.begin() + pending_playback_offset,
+                pending_playback_pcm.begin() + pending_playback_offset + chunk_samples);
             if (!audio_service.PushPcmToPlaybackQueue(std::move(playback_pcm), 0, wait_for_queue)) {
                 if (!wait_for_queue) {
                     break;
@@ -290,29 +361,21 @@ bool Mp3UrlPlayer::DecodeAndPlay(const std::string& url) {
                 ESP_LOGE(TAG, "Failed to enqueue playback pcm");
                 return false;
             }
-            pending_playback_pcm.erase(
-                pending_playback_pcm.begin(),
-                pending_playback_pcm.begin() + chunk_samples);
+            pending_playback_offset += chunk_samples;
+            compact_pending_pcm();
         }
         return true;
     };
 
-    while (!stop_requested_.load() && !end_of_stream) {
-        int read_size = http->Read(reinterpret_cast<char*>(read_buffer.data()), read_buffer.size());
-        if (read_size < 0) {
-            ESP_LOGE(TAG, "Failed to read mp3 stream, last_error=%d", http->GetLastError());
-            success = false;
-            break;
-        }
-        if (read_size == 0) {
-            end_of_stream = true;
-            break;
-        }
+    size_t mp3_offset = 0;
+    while (!stop_requested_.load() && !end_of_stream && mp3_offset < mp3_data.size()) {
+        size_t read_size = std::min(kReadBufferSize, mp3_data.size() - mp3_offset);
+        bool is_last_chunk = mp3_offset + read_size >= mp3_data.size();
 
         esp_audio_simple_dec_raw_t raw = {
-            .buffer = read_buffer.data(),
+            .buffer = mp3_data.data() + mp3_offset,
             .len = static_cast<uint32_t>(read_size),
-            .eos = false,
+            .eos = is_last_chunk,
             .consumed = 0,
             .frame_recover = ESP_AUDIO_SIMPLE_DEC_RECOVERY_NONE,
         };
@@ -401,7 +464,8 @@ bool Mp3UrlPlayer::DecodeAndPlay(const std::string& url) {
                     end_of_stream = true;
                     break;
                 }
-                if (pending_playback_pcm.size() > playback_max_pending_samples &&
+                compact_pending_pcm();
+                if (pending_sample_count() > playback_max_pending_samples &&
                     !flush_pending_pcm(false, true)) {
                     success = false;
                     end_of_stream = true;
@@ -424,6 +488,7 @@ bool Mp3UrlPlayer::DecodeAndPlay(const std::string& url) {
                 break;
             }
         }
+        mp3_offset += read_size;
     }
 
     if (success && !stop_requested_.load() && !flush_pending_pcm(true, true)) {
@@ -443,6 +508,5 @@ bool Mp3UrlPlayer::DecodeAndPlay(const std::string& url) {
         esp_ae_rate_cvt_close(resampler);
     }
     esp_audio_simple_dec_close(decoder);
-    http->Close();
     return success;
 }
