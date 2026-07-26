@@ -791,6 +791,28 @@ config WAKE_WORD_DETECTION_IN_LISTENING
         which allows interrupting the current conversation.
         When disabled (default), wake word detection is turned off during listening.
 
+config REPRO_TEXT_LISTEN_SESSION_CONFLICT
+    bool "Reproduce text detect/start disconnect bug"
+    default n
+    help
+        For reproducing issue #1836 only.
+
+        When enabled, a button press from Idle intentionally sends a text
+        listen.detect first and then immediately enters Listening, which
+        causes the device to send listen.start on the same session_id.
+
+        This intentionally follows the problematic sequence reported in the
+        issue discussion, so the backend may close the websocket shortly
+        after returning TTS.
+
+config REPRO_TEXT_LISTEN_SESSION_CONFLICT_TEXT
+    string "Repro text payload"
+    default "hello"
+    depends on REPRO_TEXT_LISTEN_SESSION_CONFLICT
+    help
+        Text sent in the injected listen.detect packet when reproduction
+        mode is enabled.
+
 config USE_AUDIO_PROCESSOR
     bool "Enable Audio Noise Reduction"
     default y

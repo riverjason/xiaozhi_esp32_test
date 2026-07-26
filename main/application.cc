@@ -694,6 +694,15 @@ void Application::HandleToggleChatEvent() {
 
     if (state == kDeviceStateIdle) {
         ListeningMode mode = GetDefaultListeningMode();
+#if CONFIG_REPRO_TEXT_LISTEN_SESSION_CONFLICT
+        SetDeviceState(kDeviceStateConnecting);
+        // Reproduce issue #1836 comment flow by sending text detect before listen.start
+        // on the same session opened from a button click path.
+        Schedule([this, mode]() {
+            ContinueTextSessionConflictRepro(mode);
+        });
+        return;
+#endif
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update)
@@ -722,6 +731,25 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
         }
     }
 
+    SetListeningMode(mode);
+}
+
+void Application::ContinueTextSessionConflictRepro(ListeningMode mode) {
+    if (GetDeviceState() != kDeviceStateConnecting) {
+        return;
+    }
+
+    if (!protocol_->IsAudioChannelOpened()) {
+        if (!protocol_->OpenAudioChannel()) {
+            return;
+        }
+    }
+
+    constexpr const char* kReproText = CONFIG_REPRO_TEXT_LISTEN_SESSION_CONFLICT_TEXT;
+    ESP_LOGW(TAG,
+        "Repro mode enabled: sending listen.detect(text=%s) before listen.start on session_id=%s",
+        kReproText, protocol_->session_id().c_str());
+    protocol_->SendWakeWordDetected(kReproText);
     SetListeningMode(mode);
 }
 
